@@ -1,0 +1,180 @@
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(fpc)
+library(cluster)
+library(ggplot2)
+library(textstem)
+library(koRpus)
+library(stringi)
+library(topicmodels)
+library(knitr)
+library(Rgraphviz)
+library(lubridate)
+library(factoextra)
+
+#loading the data and creating a Corpus
+setwd("C:/Users/dgbudale/Downloads")
+docs<-read.csv("inaugural_speeches.csv",stringsAsFactors = F)#, row.names=1)
+copy<-docs
+docsname<-Corpus(VectorSource(docs$Name))
+docs = Corpus(VectorSource(docs$text))
+
+#Data preprocessing
+#Removal of white space
+docs<-tm_map(docs,stripWhitespace)
+#Removal of Hyphen
+toSpace<-content_transformer(function(x,pattern) gsub(pattern," ",x))
+docs<-tm_map(docs,toSpace,"-")
+#Removal of Punctuations
+docs<-tm_map(docs,removePunctuation)
+#Convert to lower case
+docs<-tm_map(docs,content_transformer(tolower))
+#Remove numbers
+docs<-tm_map(docs,removeNumbers)
+#Remove Stopwords
+docs<-tm_map(docs,removeWords,stopwords("english"))
+docs<-tm_map(docs,removeWords,stopwords("SMART"))
+#Lemmatization
+lem<-make_lemma_dictionary(docs,engine="treetagger",path="C:/TreeTagger")
+docs<-tm_map(docs,lemmatize_strings,dictionary=lem)
+docs<-tm_map(docs,stripWhitespace)
+#Replace the similiar meaning words
+docs<-tm_map(docs,content_transformer(gsub),pattern="citizen",replacement="public") 
+docs<-tm_map(docs,content_transformer(gsub),pattern="people",replacement="public") 
+docs<-tm_map(docs,content_transformer(gsub),pattern="american",replacement="public") 
+docs<-tm_map(docs,content_transformer(gsub),pattern="national",replacement="nation")
+docs<-tm_map(docs,content_transformer(gsub),pattern="country",replacement="nation")
+docs<-tm_map(docs,content_transformer(gsub),pattern="america",replacement="nation")
+docs<-tm_map(docs,content_transformer(gsub),pattern="freedom",replacement="free") 
+
+#Document Term Matrix
+dtm<-DocumentTermMatrix(docs)
+m<-as.matrix(dtm)
+freq<-colSums(m)
+#Remove Sparse Items that appear in less than 50% of documents
+dtms<-removeSparseTerms(dtm,0.5)
+freqs<-colSums(as.matrix(dtms))
+findFreqTerms(dtm,lowfreq = 45)
+
+#Correlation Plot
+plot(dtm, terms=findFreqTerms(dtm, lowfreq=50)[1:15], corThreshold=0.5)
+
+#Word Frequencies Plot
+wf<-data.frame(word=names(freq),freq=freq)
+p<-ggplot(subset(wf,freq>90),aes(word,freq))
+p<-p+geom_bar(stat = "identity")
+p<-p+theme(axis.text.x=element_text(angle=45,hjust=1))
+p
+
+#Word Cloud
+set.seed(1234)
+dark2<-brewer.pal(6,"Dark2")
+wordcloud(names(freq),freq, min.freq=40,max.words=200,rot.per = 0.2,colors = dark2)
+
+#Dissimiliarity Matrix
+d<-dist(t(dtms),method="euclidian")
+
+#Identifying optimal number of clusters using elbow plot
+set.seed(1234)
+par(mai=c(1,1,1,1))
+bss<-integer(length(2:15))
+for(i in 2:15) bss[i]<-kmeans(d,centers=i)$betweenss
+plot(1:15, bss, type="b",xlab="Number of Clusters",ylab="Sum of Squares",col="blue")
+wss<-integer(length(2:15))
+for(i in 2:15) wss[i]<-kmeans(d,centers=i)$tot.withinss
+lines(1:15,wss,type="b")
+
+#K-mean clustering
+set.seed(1234)
+kfit<-kmeans(d,3)
+par(mai=c(1,1,1,1))
+clusplot(as.matrix(d),kfit$cluster,color = T,shade = T, labels = 2, lines = 0)
+
+#Silhouette analysis
+sil4<-silhouette(kfit$cluster,d)
+rownames(sil4)<-rownames(t(dtms))
+fviz_silhouette(sil4)
+neg_sil4<-which(sil4[,"sil_width"]<0)
+sil4[neg_sil4,,drop=FALSE]
+
+#K-means with PCA
+set.seed(1234)
+tf_idf<-weightTfIdf(dtm)
+tf_idf_mat<-as.matrix(tf_idf)
+tf_idf_norm <- tf_idf_mat / apply(tf_idf_mat, MARGIN = 1, FUN = function(x) sum(x^2)^0.5)
+km_clust <- kmeans(x = tf_idf_norm, centers = 3, iter.max = 25)
+#plot(prcomp(tf_idf_norm)$x, col=km_clust$cl)
+
+pca_comp <- prcomp(tf_idf_norm)
+pca_rep<-data.frame(Name=paste(copy$No,copy$Name,year(mdy(copy$Date)),sep=" - "),pc1=pca_comp$x[,1],pc2=pca_comp$x[,2],clust_id=as.factor(km_clust$cluster))
+par(mai=c(1,1,1,1))
+ggplot(data = pca_rep, mapping = aes(x = pc1, y = pc2, color = clust_id)) +
+    scale_color_brewer(palette = 'Set1') +
+    geom_text(mapping = aes(label = Name), size = 2.5, fontface = 'bold') +
+    labs(title = 'K-Means Cluster: 4 clusters on PCA Features',
+         x = 'Principal Component Analysis: Factor 1',
+         y = 'Principal Component Analysis: Factor 2') +
+    theme_grey() +
+    theme(legend.position = 'right',
+          legend.title = element_blank())
+
+#Cluster Dendogram
+cd_dtms<-removeSparseTerms(dtm,0.3)
+cd_d<-dist(t(cd_dtms),method="euclidian")
+set.seed(1234)
+fit<-hclust(d=cd_d, method="ward.D2")
+plot(fit,hang=-1)
+plot.new()
+plot(fit,hang=-1)
+groups<-cutree(fit,k=3)
+rect.hclust(fit,k=3,border="red")    
+
+#Dendogram clusteting for documents
+set.seed(1234)
+dtm$dimnames$Docs<-paste(copy$No,copy$Name,sep="-")
+tf_idf<-weightTfIdf(dtm,normalize=TRUE)
+tf_idf_mat<-as.matrix(tf_idf)
+tf_idf_dist <- dist(tf_idf_mat, method = 'euclidian')
+clust_h <- hclust(d = tf_idf_dist, method = 'ward.D2')
+plot(clust_h, main = 'Cluster Dendrogram: Ward Distance', xlab = '', ylab = '', sub = '')
+plot.new()
+plot(clust_h, main = 'Cluster Dendrogram: Ward Distance', xlab = '', ylab = '', sub = '')
+groups<-cutree(clust_h,k=4)
+rect.hclust(clust_h,k=4,border="red")
+
+#Topic Modeling
+set.seed(1234)
+burnin <- 4000
+iter <- 2000
+thin <- 500
+seed <-list(2003,5,63,100001,765)
+nstart <- 5
+best <- TRUE
+k<-5
+ldaout <-LDA(dtms,k, method="Gibbs", control=list(nstart=nstart, seed = seed, best=best, burnin = burnin, iter = iter, thin=thin))
+
+ldatopics<-as.matrix(topics(ldaout))
+ldaterms<-as.matrix(terms(ldaout,6))
+topicProbabilities <- as.data.frame(ldaout@gamma)
+
+barplot(table(ldatopics),names.arg=c("Topic-1","Topic-2","Topic-3","Topic-4","Topic-5"),
+col=rainbow(5),main="total documents per topic",ylab="num of document")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
